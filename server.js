@@ -9,13 +9,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL connection
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Initialize database tables
 const initDb = async () => {
   const client = await pool.connect();
   try {
@@ -36,7 +34,8 @@ const initDb = async () => {
         snapshot JSONB,
         start_date TIMESTAMP,
         end_date TIMESTAMP,
-        last_updated TIMESTAMP
+        last_updated TIMESTAMP,
+        publisher_platform JSONB
       );
     `);
   } finally {
@@ -46,19 +45,15 @@ const initDb = async () => {
 
 initDb();
 
-// Search advertisers endpoint
 app.get('/api/search-advertisers', async (req, res) => {
   const { query, country_code } = req.query;
 
-  if (!query) {
-    return res.status(400).json({ error: 'Query parameter is required' });
-  }
+  if (!query) return res.status(400).json({ error: 'Query parameter is required' });
 
   try {
     const response = await fetch(
       `https://ad-libraries.p.rapidapi.com/meta/search/pages?query=${encodeURIComponent(query)}&country_code=${country_code || 'PL'}`,
       {
-        method: 'GET',
         headers: {
           'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
           'X-RapidAPI-Host': 'ad-libraries.p.rapidapi.com'
@@ -66,13 +61,9 @@ app.get('/api/search-advertisers', async (req, res) => {
       }
     );
 
-    if (!response.ok) {
-      throw new Error(`API responded with status: ${response.status}`);
-    }
-
+    if (!response.ok) throw new Error(`API status: ${response.status}`);
     const data = await response.json();
 
-    // Store results in PostgreSQL
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -84,14 +75,7 @@ app.get('/api/search-advertisers', async (req, res) => {
            ON CONFLICT (id) DO UPDATE SET
            name = $2, category = $3, likes = $4, ig_followers = $5, 
            last_updated = NOW(), search_result = $6`,
-          [
-            result.id,
-            result.name,
-            result.category,
-            result.likes,
-            result.igFollowers,
-            result
-          ]
+          [result.id, result.name, result.category, result.likes, result.igFollowers, result]
         );
       }
       
@@ -105,69 +89,64 @@ app.get('/api/search-advertisers', async (req, res) => {
 
     res.json(data);
   } catch (error) {
-    console.error('Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get page ads endpoint
 app.get('/api/page-ads/:pageId', async (req, res) => {
   const { pageId } = req.params;
-  const { country_code = 'US' } = req.query;
+  const { country_code = 'US', continuation_token } = req.query;
 
   try {
-    // Check cache first
     const client = await pool.connect();
     try {
-      const cachedAds = await client.query(
-        `SELECT * FROM ads 
-         WHERE page_id = $1 
-         AND last_updated > NOW() - INTERVAL '24 hours'`,
-        [pageId]
-      );
+      if (!continuation_token) {
+        const cachedAds = await client.query(
+          `SELECT * FROM ads 
+           WHERE page_id = $1 
+           AND last_updated > NOW() - INTERVAL '24 hours'`,
+          [pageId]
+        );
 
-      if (cachedAds.rows.length > 0) {
-        return res.json({ results: cachedAds.rows });
-      }
-
-      // Fetch from API if not cached
-      const response = await fetch(
-        `https://ad-libraries.p.rapidapi.com/meta/page/ads?page_id=${pageId}&country_code=${country_code}&platform=facebook%2Cinstagram&media_types=all&active_status=all`,
-        {
-          method: 'GET',
-          headers: {
-            'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
-            'X-RapidAPI-Host': 'ad-libraries.p.rapidapi.com'
-          }
+        if (cachedAds.rows.length > 0) {
+          return res.json({ results: [cachedAds.rows] });
         }
-      );
-
-      if (!response.ok) {
-        throw new Error(`API responded with status: ${response.status}`);
       }
 
+      const url = `https://ad-libraries.p.rapidapi.com/meta/page/ads?page_id=${pageId}&country_code=${country_code}&platform=facebook%2Cinstagram&media_types=all&active_status=all${continuation_token ? `&continuation_token=${continuation_token}` : ''}`;
+      
+      const response = await fetch(url, {
+        headers: {
+          'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
+          'X-RapidAPI-Host': 'ad-libraries.p.rapidapi.com'
+        }
+      });
+
+      if (!response.ok) throw new Error(`API status: ${response.status}`);
       const data = await response.json();
 
-      // Store ads in PostgreSQL
-      await client.query('BEGIN');
-      
-      await client.query('DELETE FROM ads WHERE page_id = $1', [pageId]);
-      
-      for (const result of data.results.flat()) {
-        await client.query(
-          `INSERT INTO ads (ad_archive_id, page_id, snapshot, start_date, end_date, last_updated)
-           VALUES ($1, $2, $3, $4, $5, NOW())`,
-          [
-            result.adArchiveID,
-            pageId,
-            result.snapshot,
-            new Date(result.startDate * 1000),
-            new Date(result.endDate * 1000)
-          ]
-        );
+      if (!continuation_token) {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM ads WHERE page_id = $1', [pageId]);
+        
+        for (const result of data.results.flat()) {
+          await client.query(
+            `INSERT INTO ads (ad_archive_id, page_id, snapshot, start_date, end_date, last_updated, publisher_platform)
+             VALUES ($1, $2, $3, $4, $5, NOW(), $6)`,
+            [
+              result.adArchiveID,
+              pageId,
+              result.snapshot,
+              new Date(result.startDate * 1000),
+              new Date(result.endDate * 1000),
+              result.publisherPlatform
+            ]
+          );
+        }
+        
+        await client.query('COMMIT');
       }
-      
-      await client.query('COMMIT');
+
       res.json(data);
     } catch (error) {
       await client.query('ROLLBACK');
@@ -176,12 +155,9 @@ app.get('/api/page-ads/:pageId', async (req, res) => {
       client.release();
     }
   } catch (error) {
-    console.error('Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
